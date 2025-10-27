@@ -1,0 +1,8 @@
+node_modules
+.env
+.ai
+data.json
+changes/*
+bin/changes/*
+worker-config.json
+agent_logs/*
