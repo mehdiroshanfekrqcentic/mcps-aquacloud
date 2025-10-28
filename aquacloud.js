@@ -19,7 +19,6 @@ app.use(express.json({ limit: '50mb' }));
 app.use(cors({
     origin: '*',
     exposedHeaders: ['Mcp-Session-Id'],
-    // Add your custom headers to the allowedHeaders list
     allowedHeaders: [
         'Content-Type', 'mcp-session-id', 'X-API-KEY', 'x-mapping-id', 'x-task-id',
         'x-user-query', 'x-project-id', 'x-aqua-username', 'x-aqua-password',
@@ -30,6 +29,57 @@ app.use(cors({
 // In-memory store for session data, keyed by session ID.
 const sessionTransports = {};
 const sessionMemoryStore = {};
+
+/**
+ * Parses a raw Aqua item ID (which may have a prefix) into its numeric ID and item type.
+ * @param {string} rawId - The raw ID string (e.g., "DF012345" or "12345").
+ * @param {string | null | undefined} [explicitType] - The explicitly provided item type, if any.
+ * @returns {{itemId: string, itemType: string}}
+ * @throws {Error} if the item type cannot be determined.
+ */
+function parseAquaItemId(rawId, explicitType) {
+    if (!rawId || typeof rawId !== 'string') {
+        throw new Error("Invalid or missing item ID provided to parser.");
+    }
+
+    let finalId = rawId;
+    let finalType = explicitType;
+    let prefixType = null;
+
+    // Regex to find a prefix (RQ, TC, DF), followed by optional zeros/digits, and capture the main numeric ID part
+    const rqMatch = rawId.match(/^[rR][qQ](\d+)$/);
+    const tcMatch = rawId.match(/^[tT][cC](\d+)$/);
+    const dfMatch = rawId.match(/^[dD][fF](\d+)$/);
+
+    if (rqMatch && rqMatch[1]) {
+        prefixType = 'Requirement';
+        finalId = rqMatch[1]; // The captured numeric part
+    } else if (tcMatch && tcMatch[1]) {
+        prefixType = 'TestCase';
+        finalId = tcMatch[1];
+    } else if (dfMatch && dfMatch[1]) {
+        prefixType = 'Defect';
+        finalId = dfMatch[1];
+    }
+    // If no match, finalId remains the original rawId
+
+    if (!finalType) {
+        if (prefixType) {
+            finalType = prefixType; // Infer type from prefix if no explicit type was given
+        } else {
+            // No explicit type, and no prefix found. We cannot determine the type.
+            throw new Error(`Could not determine itemType for ID "${rawId}". Please provide an explicit 'itemType' or use an ID with a recognized prefix (e.g., DF0123, RQ0123, TC0123).`);
+        }
+    }
+    console.log(finalId, finalType)
+
+    // Return the numeric ID and the determined item type
+    // If explicitType was provided, it wins.
+    // If rawId was "DF0123" and explicitType was "Requirement",
+    // this returns { itemId: "0123", itemType: "Requirement" }
+    return { itemId: finalId, itemType: finalType };
+}
+
 
 /**
  * Ensures the AquaCloud auth token is valid, refreshing if necessary.
@@ -44,7 +94,7 @@ async function getAquaAuth(sessionMemory) {
     }
 
     const aquaUrl = sessionMemory.user.aquacloud_url;
-    
+
     // Try to refresh the token first
     if (sessionMemory.aquaAuth && sessionMemory.aquaAuth.refresh_token) {
         try {
@@ -85,29 +135,36 @@ function createMcpServer(sessionMemory) {
         version: "1.0.0"
     });
 
+    // This wrapper handles auth and catches errors, including parsing errors
     const withAuth = async (toolFn) => {
         try {
             const auth = await getAquaAuth(sessionMemory);
             const aquaUrl = sessionMemory.user.aquacloud_url;
             return await toolFn(auth, aquaUrl);
         } catch (error) {
+            // This will catch errors from parseAquaItemId as well
             const errorMessage = error.response ? JSON.stringify(error.response.data) : error.message;
-            console.error(`[Aqua-MCP-Standalone] Tool execution error:`, error);
+            console.error(`[Aqua-MCP-Standalone] Tool execution error:`, error.message);
             return { content: [{ type: "text", text: `Error: ${errorMessage}` }] };
         }
     };
-    
+
     server.registerTool("aquacloud_get-item-details", {
         title: "Get Aqua Cloud Item Details",
         description: "Fetches the full details of an Aqua Cloud work item (e.g., Requirement, Defect, TestCase).",
         inputSchema: {
-            itemId: z.string().optional().describe("The ID of the item. Defaults to the task ID from the session."),
-            itemType: z.string().describe("The type of the item (e.g., 'Requirement', 'Defect', 'TestCase')."),
+            itemId: z.string().optional().describe("The ID of the item, with or without its prefix (e.g., 'DF068415' or '68415'). Defaults to the task ID from the session."),
+            itemType: z.string().optional().describe("The type of the item (e.g., 'Requirement', 'Defect'). If omitted, the type will be inferred from the itemId prefix."),
         }
     }, (input) => withAuth(async (auth, aquaUrl) => {
-        const itemId = input.itemId;
-        if (!itemId) return { content: [{ type: "text", text: "Error: No itemId provided and none found in session." }] };
-        const details = await aquaUtils.getItemDetails(aquaUrl, auth, itemId, input.itemType);
+        const rawItemId = input.itemId || sessionMemory.taskId; // Use session task ID as fallback
+        if (!rawItemId) {
+            return { content: [{ type: "text", text: "Error: No itemId provided and none found in session." }] };
+        }
+
+        const { itemId, itemType } = parseAquaItemId(rawItemId, input.itemType);
+        
+        const details = await aquaUtils.getItemDetails(aquaUrl, auth, itemId, itemType);
         const processedDetails = {
             title: details.Name,
             description: {
@@ -122,23 +179,28 @@ function createMcpServer(sessionMemory) {
         title: "Add Comment to Aqua Cloud Item",
         description: "Adds a comment to the discussion history of an Aqua Cloud work item. Requires a mapping to be set in the session.",
         inputSchema: {
-            itemId: z.string().optional().describe("The ID of the item. Defaults to the task ID from the session."),
+            itemId: z.string().optional().describe("The ID of the item, with or without its prefix (e.g., 'DF068415' or '68415'). Defaults to the task ID from the session."),
             comment: z.string().describe("The content of the comment to add. Supports HTML."),
-            itemType: z.string().describe("The type of the item (e.g., 'Requirement', 'Defect', 'TestCase')."),
+            itemType: z.string().optional().describe("The type of the item (e.g., 'Requirement', 'Defect'). If omitted, the type will be inferred from the itemId prefix."),
         }
     }, (input) => withAuth(async (auth, aquaUrl) => {
-        const { itemType, comment, itemId } = input;
-        if (!itemId) return { content: [{ type: "text", text: "Error: No itemId provided and none found in session." }] };
+        const rawItemId = input.itemId || sessionMemory.taskId; // Use session task ID as fallback
+        if (!rawItemId) {
+            return { content: [{ type: "text", text: "Error: No itemId provided and none found in session." }] };
+        }
+
+        const { itemId, itemType } = parseAquaItemId(rawItemId, input.itemType);
+        const { comment } = input;
 
         await aquaUtils.addCommentToItem(aquaUrl, auth, itemId, comment, itemType);
-        return { content: [{ type: "text", text: `Successfully added comment to item ${itemId}.` }] };
+        return { content: [{ type: "text", text: `Successfully added comment to item ${itemType} ${itemId}.` }] };
     }));
 
     server.registerTool("aquacloud_create-item", {
         title: "Create Item in Aqua Cloud",
         description: "Creates one or more items (e.g., a Requirement). If a parentItemId is provided, it creates sub-items. Otherwise, it creates top-level items in a project.",
         inputSchema: {
-            parentItemId: z.string().optional().describe("The ID of the parent Requirement. If provided, creates sub-items. Defaults to the task ID from the session if available."),
+            parentItemId: z.string().optional().describe("The ID of the parent Requirement, with or without prefix (e.g., 'RQ0123'). If provided, creates sub-items."),
             itemType: z.string().default('Requirement').describe("The type of item to create. Defaults to 'Requirement'."),
             tasks: z.array(z.object({
                 title: z.string().describe("The title of the item."),
@@ -146,18 +208,25 @@ function createMcpServer(sessionMemory) {
             })).describe("An array of item objects to create."),
         }
     }, (input) => withAuth(async (auth, aquaUrl) => {
-        const parentItemId = input.parentItemId;
+        const rawParentId = input.parentItemId;
         const projectId = sessionMemory.aquaProjectId;
+        let numericParentId = null;
 
         if (!projectId) {
-            return { content: [{ type: "text", text: "Error: No projectId provided, and neither was found in the session." }] };
+            return { content: [{ type: "text", text: "Error: No projectId found in the session." }] };
+        }
+
+        if (rawParentId && rawParentId !== "%TASK_CONTEXT_TASK_ID%") {
+            // A parent is assumed to be a Requirement, but parseAquaItemId will handle any prefix
+            // We pass 'Requirement' as the default type if no prefix is found.
+            const { itemId: parsedId } = parseAquaItemId(rawParentId, 'Requirement');
+            numericParentId = parsedId;
         }
 
         const createdItems = [];
         for (const task of input.tasks) {
-            // The createItem function correctly handles parentRequirementId being null.
             const result = await aquaUtils.createItem(aquaUrl, auth, task, {
-                parentRequirementId: parentItemId && parentItemId != "%TASK_CONTEXT_TASK_ID%" ? parentItemId : null,
+                parentRequirementId: numericParentId, // This is now the parsed numeric ID
                 projectId: projectId,
                 itemType: input.itemType
             });
@@ -170,12 +239,22 @@ function createMcpServer(sessionMemory) {
         title: "Get Test Steps for a TestCase",
         description: "Fetches the detailed test steps for a given TestCase item.",
         inputSchema: {
-            testCaseId: z.string().optional().describe("The ID of the TestCase item. Defaults to task ID from session."),
+            testCaseId: z.string().optional().describe("The ID of the TestCase item, with or without prefix (e.g., 'TC0123' or '123'). Defaults to task ID from session."),
         }
     }, (input) => withAuth(async (auth, aquaUrl) => {
-        const testCaseId = input.testCaseId;
-        if (!testCaseId) return { content: [{ type: "text", text: "Error: No testCaseId provided and none found in session." }] };
-        const steps = await aquaUtils.getTestSteps(aquaUrl, auth, testCaseId);
+        const rawItemId = input.testCaseId || sessionMemory.taskId;
+        if (!rawItemId) {
+            return { content: [{ type: "text", text: "Error: No testCaseId provided and none found in session." }] };
+        }
+        
+        // For this tool, we force the type to 'TestCase'
+        const { itemId, itemType } = parseAquaItemId(rawItemId, 'TestCase');
+
+        if (itemType.toLowerCase() !== 'testcase') {
+             return { content: [{ type: "text", text: `Error: The provided ID "${rawItemId}" does not appear to be a TestCase.` }] };
+        }
+
+        const steps = await aquaUtils.getTestSteps(aquaUrl, auth, itemId);
         return { content: [{ type: "text", text: JSON.stringify(steps, null, 2) }] };
     }));
 
@@ -183,16 +262,26 @@ function createMcpServer(sessionMemory) {
         title: "Add Test Steps to a TestCase",
         description: "Adds one or more test steps to an existing Aqua Cloud TestCase item. This requires locking the item.",
         inputSchema: {
-            itemId: z.string().optional().describe("The ID of the TestCase. Defaults to the task ID from the session."),
-            itemType: z.string().optional().default('TestCase').describe("The type of the item. Must be a type that supports test steps, like 'TestCase'."),
+            itemId: z.string().optional().describe("The ID of the TestCase, with or without prefix (e.g., 'TC0123' or '123'). Defaults to the task ID from the session."),
+            itemType: z.string().optional().default('TestCase').describe("The type of the item. Must be 'TestCase' or a type that supports test steps."),
             steps: z.array(z.object({
                 name: z.string().describe("The name or title of the test step."),
-                description: z.string().describe("The detailed description or action for the test step."),
+                instructions: z.string().describe("The detailed instructions or actions for the test step (as HTML text)."),
+                expectedResult: z.string().describe("The expected result for the test step (as HTML text)."),
             })).describe("An array of test step objects to add."),
         }
     }, (input) => withAuth(async (auth, aquaUrl) => {
-        const itemId = input.itemId;
-        if (!itemId) return { content: [{ type: "text", text: "Error: No itemId provided and none found in session." }] };
+        const rawItemId = input.itemId || sessionMemory.taskId;
+        if (!rawItemId) {
+            return { content: [{ type: "text", text: "Error: No itemId provided and none found in session." }] };
+        }
+
+        // Default to 'TestCase' if not provided
+        const { itemId, itemType } = parseAquaItemId(rawItemId, input.itemType || 'TestCase');
+
+        if (itemType.toLowerCase() !== 'testcase') {
+             return { content: [{ type: "text", text: `Error: The provided ID "${rawItemId}" does not appear to be a TestCase.` }] };
+        }
 
         const existingSteps = await aquaUtils.getTestSteps(aquaUrl, auth, itemId);
         const currentStepCount = Array.isArray(existingSteps) ? existingSteps.length : 0;
@@ -201,8 +290,8 @@ function createMcpServer(sessionMemory) {
             TestSteps: {
                 Added: input.steps.map((step, index) => ({
                     Name: step.name,
-                    Description: { Html: step.description },
-                    ExpectedResult: { Html: "" },
+                    Description: { Html: step.instructions },
+                    ExpectedResult: { Html: step.expectedResult },
                     Automation: null,
                     Index: currentStepCount + index + 1,
                     StepType: 'Step',
@@ -211,9 +300,10 @@ function createMcpServer(sessionMemory) {
             }
         };
 
-        const result = await aquaUtils.updateLockedItem(aquaUrl, auth, itemId, input.itemType, updatePayload);
+        const result = await aquaUtils.updateLockedItem(aquaUrl, auth, itemId, itemType, updatePayload);
         return { content: [{ type: "text", text: `Successfully added ${input.steps.length} test step(s) to item ${itemId}. Response: ${JSON.stringify(result, null, 2)}` }] };
     }));
+
 
     return server;
 }
@@ -226,7 +316,7 @@ app.post('/mcp', async (req, res) => {
     if (sessionId && sessionTransports[sessionId]) {
         transport = sessionTransports[sessionId];
     } else if (!sessionId && isInitializeRequest(req.body)) {
-        
+
         // --- MODIFICATION START ---
         // Read credentials from headers instead of handshakeParams
         console.log("[Aqua-MCP-Standalone] Received initialize request. Checking headers...");
@@ -234,7 +324,8 @@ app.post('/mcp', async (req, res) => {
             'x-aqua-username': username,
             'x-aqua-password': password,
             'x-aqua-url': aquacloud_url,
-            'x-aqua-projectid': projectId
+            'x-aqua-projectid': projectId,
+            'x-task-id': taskId // Capture the task ID from headers
         } = req.headers;
 
         if (!username || !password || !aquacloud_url || !projectId) {
@@ -247,6 +338,7 @@ app.post('/mcp', async (req, res) => {
 
         try {
             console.log(`[Aqua-MCP-Standalone] Credentials provided for user: ${username}`);
+            console.log(`[Aqua-MCP-Standalone] Context Task ID: ${taskId || 'N/A'}`); // Log the task ID
 
             const newSessionId = randomUUID();
 
@@ -260,6 +352,7 @@ app.post('/mcp', async (req, res) => {
             sessionMemoryStore[newSessionId] = {
                 user,
                 aquaProjectId: projectId, // Use project ID from header
+                taskId: taskId || null, // Store the task ID in session memory
             };
             console.log(`[Aqua-MCP-Standalone] New session initialized: ${newSessionId}`);
 
@@ -278,7 +371,7 @@ app.post('/mcp', async (req, res) => {
                     server.close();
                 }
             };
-            
+
             await server.connect(transport);
         } catch (error) {
             console.error('[Aqua-MCP-Standalone] Initialization error:', error);
@@ -288,6 +381,17 @@ app.post('/mcp', async (req, res) => {
         return res.status(400).json({ error: { message: 'Bad Request: A valid mcp-session-id header is required for non-initialize requests.' } });
     }
 
+    // --- Add Task ID to session on subsequent requests ---
+    // This ensures that even if the task ID changes, we capture it.
+    if (transport && transport.sessionId && req.headers['x-task-id']) {
+        const currentSessionId = transport.sessionId;
+        if (sessionMemoryStore[currentSessionId] && sessionMemoryStore[currentSessionId].taskId !== req.headers['x-task-id']) {
+             console.log(`[Aqua-MCP-Standalone] Updating Task ID for session ${currentSessionId}: ${req.headers['x-task-id']}`);
+             sessionMemoryStore[currentSessionId].taskId = req.headers['x-task-id'];
+        }
+    }
+    // --- End modification ---
+
     await transport.handleRequest(req, res, req.body);
 });
 
@@ -296,6 +400,16 @@ const handleSessionRequest = async (req, res) => {
     if (!sessionId || !sessionTransports[sessionId]) {
         return res.status(400).send('Invalid or missing mcp-session-id header');
     }
+
+    // --- Add Task ID to session on subsequent requests ---
+    if (req.headers['x-task-id']) {
+         if (sessionMemoryStore[sessionId] && sessionMemoryStore[sessionId].taskId !== req.headers['x-task-id']) {
+             console.log(`[Aqua-MCP-Standalone] Updating Task ID for session ${sessionId}: ${req.headers['x-task-id']}`);
+             sessionMemoryStore[sessionId].taskId = req.headers['x-task-id'];
+        }
+    }
+    // --- End modification ---
+
     const transport = sessionTransports[sessionId];
     await transport.handleRequest(req, res);
 };
